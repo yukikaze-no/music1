@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Music Analyzer</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    input {
+      width: 80%;
+      padding: 8px;
+      font-size: 16px;
+    }
+    button {
+      padding: 10px 20px;
+      font-size: 16px;
+      margin-left: 10px;
+    }
+    pre {
+      background: #222;
+      color: #0f0;
+      padding: 15px;
+      white-space: pre-wrap;
+      border-radius: 8px;
+    }
+  </style>
+</head>
+<body>
+
+  <h2>🎧 Music Analyzer（自動ノーツ生成ツール）</h2>
+
+  <p>mp3 の URL を入力してください：</p>
+
+  <input id="urlInput" placeholder="https://yukikaze-no.github.io/music/BornIn2026_1.mp3">
+  <button onclick="analyze()">解析</button>
+
+  <h3>ステータス</h3>
+  <p id="status">待機中</p>
+
+  <h3>解析結果（JSON）</h3>
+  <pre id="output">ここにノーツデータが表示されます</pre>
+
+  <script src="analyzer.js"></script>
+</body>
+</html>
