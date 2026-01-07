@@ -1,14 +1,14 @@
 let audioCtx = null;
 
 /* ============================================================
-   1. mp3 を読み込む
+   1. mp3 を読み込む（AudioContext 停止問題を完全回避）
 ============================================================ */
 async function loadAudio(url) {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   }
 
-  // AudioContext が停止していたら再開（重要）
+  // ★ ブラウザの自動再生制限対策（最重要）
   if (audioCtx.state === "suspended") {
     await audioCtx.resume();
   }
@@ -130,7 +130,7 @@ async function estimateBPMHighPrecision(audioBuffer, frameSize = 1024) {
 }
 
 /* ============================================================
-   8. ノーツ生成（4レーン・ロング対応）
+   8. ノーツ生成（4レーン・ロング対応・重複禁止）
 ============================================================ */
 function generateNotes(peaks, bpm, frameSize, sampleRate) {
   const allNotes = [];
@@ -143,9 +143,23 @@ function generateNotes(peaks, bpm, frameSize, sampleRate) {
 
     // ノーツ詰まり防止
     if (beat - lastBeat < 0.25) continue;
-    lastBeat = beat;
 
     const lane = Math.floor(Math.random() * 4);
+
+    // ★ ロングノーツと通常ノーツの重複禁止
+    let conflict = false;
+    for (const n of allNotes) {
+      if (n.lane === lane && n.type === "long") {
+        if (beat >= n.beat && beat <= n.endBeat) {
+          conflict = true;
+          break;
+        }
+      }
+    }
+    if (conflict) continue;
+
+    lastBeat = beat;
+
     const isLong = Math.random() < 0.20;
 
     if (isLong) {
