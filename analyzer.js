@@ -72,7 +72,7 @@ function getEnergySeries(audioBuffer, frameSize = 1024) {
 /* ============================================================
    4. ピーク検出
 ============================================================ */
-function detectPeaks(energies, thresholdFactor = 1.3) {
+function detectPeaks(energies, thresholdFactor = 1.25) {
   const avgEnergy = avg(energies);
   const threshold = avgEnergy * thresholdFactor;
 
@@ -114,7 +114,7 @@ function normalizeBPM(bpm) {
 async function estimateBPMHighPrecision(audioBuffer, frameSize = 1024) {
   const filtered = await lowpassFilter(audioBuffer);
   const { energies } = getEnergySeries(filtered, frameSize);
-  const peaks = detectPeaks(energies, 1.3);
+  const peaks = detectPeaks(energies, 1.25);
   if (peaks.length < 2) return 120;
 
   const intervals = [];
@@ -131,53 +131,57 @@ async function estimateBPMHighPrecision(audioBuffer, frameSize = 1024) {
 }
 
 /* ============================================================
-   6. 自動オフセット推定（ピーク vs 理想拍）
+   6. 自動オフセット推定（＋安全なデフォルト）
 ============================================================ */
 function estimateOffsetSec(peaks, bpm, frameSize, sampleRate) {
   const diffs = [];
+  const secPerBeat = 60 / bpm;
 
   for (let i = 0; i < peaks.length; i++) {
     const frameIndex = peaks[i];
     const time = (frameIndex * frameSize) / sampleRate; // 秒
-    const beat = (time * bpm) / 60;                     // 拍
+    const beat = time / secPerBeat;                     // 拍
 
-    const idealBeat = Math.round(beat);                 // 理想の整数拍
-    const diffBeat = beat - idealBeat;                  // 拍単位のズレ
-    const diffSec = diffBeat * (60 / bpm);              // 秒に戻す
+    const idealBeat = Math.round(beat);
+    const diffBeat = beat - idealBeat;
+    const diffSec = diffBeat * secPerBeat;
 
-    // 極端な外れ値は無視（プロが「ここは使わない」と判断する領域）
-    if (Math.abs(diffSec) < 0.15) {
+    // 外れ値は少し緩めにカット
+    if (Math.abs(diffSec) < 0.12) {
       diffs.push(diffSec);
     }
   }
 
-  const offset = avg(diffs);
-  return offset || 0;
+  let offset = avg(diffs);
+
+  // ピークが少なすぎる or 推定が不安定なときは安全な固定値に寄せる
+  if (!isFinite(offset) || Math.abs(offset) < 0.002 || diffs.length < 5) {
+    offset = 0.04; // 40ms 遅らせる（体感的にちょうどいいライン）
+  }
+
+  return offset;
 }
 
 /* ============================================================
-   7. 曲構造のざっくり解析（イントロ / 本編 / アウトロ）
+   7. 曲構造のざっくり解析（イントロ / アウトロ）
 ============================================================ */
 function analyzeStructure(energies, times) {
   const totalDur = times[times.length - 1] || 0;
   const totalAvg = avg(energies);
 
-  // 簡易：前方・中央・後方のエネルギーを見る
   const thirds = Math.floor(energies.length / 3);
   const introAvg = avg(energies.slice(0, thirds));
-  const middleAvg = avg(energies.slice(thirds, thirds * 2));
   const outroAvg = avg(energies.slice(thirds * 2));
 
-  // イントロ：エネルギーが低い & 全体の 5〜20% あたり
-  let introEndSec = totalDur * 0.05;
+  // v6 では「軽く抑える」程度に緩める
+  let introEndSec = totalDur * 0.05;   // 最初の 5% は基本スキップ
   if (introAvg < totalAvg * 0.7) {
-    introEndSec = totalDur * 0.15;
+    introEndSec = totalDur * 0.10;     // かなり静かなら 10% まで
   }
 
-  // アウトロ：エネルギーが低い & 最後の 10〜20%
-  let outroStartSec = totalDur * 0.85;
+  let outroStartSec = totalDur * 0.9;  // 最後の 10% は基本スキップ
   if (outroAvg < totalAvg * 0.7) {
-    outroStartSec = totalDur * 0.8;
+    outroStartSec = totalDur * 0.85;   // かなり静かなら少し前倒し
   }
 
   return {
@@ -192,7 +196,6 @@ function analyzeStructure(energies, times) {
 ============================================================ */
 function chooseLane() {
   const r = Math.random();
-  // 中指レーン（1,2）を多めに、薬指レーン（0,3）を控えめに
   if (r < 0.35) return 1;  // 左中指
   if (r < 0.70) return 2;  // 右中指
   if (r < 0.85) return 0;  // 左薬指
@@ -200,7 +203,7 @@ function chooseLane() {
 }
 
 /* ============================================================
-   9. ノーツ生成（自動オフセット＋構造＋重複禁止＋ロング間隔）
+   9. ノーツ生成（フィルタ緩和版）
 ============================================================ */
 function generateNotes(peaks, bpm, frameSize, sampleRate, offsetSec, structure, energies, times) {
   const allNotes = [];
@@ -208,33 +211,31 @@ function generateNotes(peaks, bpm, frameSize, sampleRate, offsetSec, structure, 
   let lastLongEnd = -999;
 
   const secPerBeat = 60 / bpm;
-
-  // 全体エネルギー平均
   const globalAvgEnergy = avg(energies);
 
   for (let i = 0; i < peaks.length; i++) {
     const frameIndex = peaks[i];
-    const rawTime = (frameIndex * frameSize) / sampleRate; // 秒
-    const time = rawTime - offsetSec;                      // オフセット補正後の時間
+    const rawTime = (frameIndex * frameSize) / sampleRate;
+    const time = rawTime - offsetSec;
 
-    if (time < 0) continue; // 曲頭より前は無視
+    if (time < 0) continue;
 
     const beat = time / secPerBeat;
 
-    // イントロ・アウトロは基本スキップ（プロが「置かない」と判断する領域）
+    // イントロ・アウトロは軽めに抑える
     if (time < structure.introEndSec) continue;
     if (time > structure.outroStartSec) continue;
 
-    // ノーツ詰まり防止
-    if (beat - lastBeat < 0.25) continue;
+    // ノーツ詰まり防止（少し緩め）
+    if (beat - lastBeat < 0.20) continue;
 
     const lane = chooseLane();
 
-    // ロングノーツの途中・終端 ±0.20 を禁止
+    // ロングノーツの途中・終端 ±0.15 を禁止（少し緩め）
     let conflict = false;
     for (const n of allNotes) {
       if (n.lane === lane && n.type === "long") {
-        if (beat >= n.beat - 0.20 && beat <= n.endBeat + 0.20) {
+        if (beat >= n.beat - 0.15 && beat <= n.endBeat + 0.15) {
           conflict = true;
           break;
         }
@@ -242,22 +243,20 @@ function generateNotes(peaks, bpm, frameSize, sampleRate, offsetSec, structure, 
     }
     if (conflict) continue;
 
-    // ロングノーツ同士の間隔確保（0.8 beat 以上）
-    const canLong = (beat - lastLongEnd >= 0.8);
+    // ロングノーツ同士の間隔確保（0.5 beat 以上に緩和）
+    const canLong = (beat - lastLongEnd >= 0.5);
 
-    // エネルギーに応じて「ここは使わない」を判断（低エネルギーはスキップ or tap のみ）
     const energy = energies[i] || 0;
     const energyRatio = energy / (globalAvgEnergy || 1);
 
-    // 極端に低いエネルギー → スキップ（静かな部分）
-    if (energyRatio < 0.4) continue;
+    // v6：低エネルギーもある程度拾う（0.2 未満だけスキップ）
+    if (energyRatio < 0.2) continue;
 
     lastBeat = beat;
 
     // ロングノーツ生成（20%）ただし条件付き
     let isLong = false;
-    if (canLong && energyRatio > 0.8) {
-      // 盛り上がっているところだけロング候補
+    if (canLong && energyRatio > 0.7) {
       isLong = Math.random() < 0.20;
     }
 
@@ -289,7 +288,7 @@ function generateNotes(peaks, bpm, frameSize, sampleRate, offsetSec, structure, 
 }
 
 /* ============================================================
-   10. メイン解析処理（全部入り）
+   10. メイン解析処理
 ============================================================ */
 async function analyze() {
   const url = document.getElementById("urlInput").value.trim();
@@ -315,7 +314,7 @@ async function analyze() {
     const { energies, times } = getEnergySeries(audioBuffer, frameSize);
 
     status.textContent = "ピーク検出中...";
-    const peaks = detectPeaks(energies, 1.3);
+    const peaks = detectPeaks(energies, 1.25);
 
     status.textContent = "曲構造解析中...";
     const structure = analyzeStructure(energies, times);
