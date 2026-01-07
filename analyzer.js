@@ -1,61 +1,57 @@
 let audioCtx = null;
 
 /* ============================================================
-   0. ユーティリティ
+   0. Utility
 ============================================================ */
 function avg(arr) {
   return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
 }
-function clamp(v, min, max) {
-  return Math.max(min, Math.min(max, v));
-}
 
 /* ============================================================
-   1. mp3 を読み込む（AudioContext 停止問題を完全回避）
+   1. Load Audio (with autoplay fix)
 ============================================================ */
 async function loadAudio(url) {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   }
-
   if (audioCtx.state === "suspended") {
     await audioCtx.resume();
   }
 
   const res = await fetch(url);
-  if (!res.ok) throw new Error("音声ファイルを取得できませんでした: " + res.status);
+  if (!res.ok) throw new Error("音声ファイルを取得できませんでした");
 
   const arrayBuffer = await res.arrayBuffer();
-  const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-  return audioBuffer;
+  return await audioCtx.decodeAudioData(arrayBuffer);
 }
 
 /* ============================================================
-   2. フィルタ（Kick / Snare 抽出）
+   2. Filter (Kick / Snare)
 ============================================================ */
-function filteredBuffer(audioBuffer, type = "lowpass", freqLow = 40, freqHigh = 150) {
+function filteredBuffer(audioBuffer, type = "lowpass", low = 40, high = 150) {
   const ctx = new OfflineAudioContext(1, audioBuffer.length, audioBuffer.sampleRate);
-  const source = ctx.createBufferSource();
-  source.buffer = audioBuffer;
+  const src = ctx.createBufferSource();
+  src.buffer = audioBuffer;
 
   const filter = ctx.createBiquadFilter();
   filter.type = type;
+
   if (type === "lowpass") {
-    filter.frequency.value = freqHigh;
+    filter.frequency.value = high;
   } else if (type === "bandpass") {
-    filter.frequency.value = (freqLow + freqHigh) / 2;
-    filter.Q.value = (freqHigh - freqLow) / filter.frequency.value;
+    filter.frequency.value = (low + high) / 2;
+    filter.Q.value = (high - low) / filter.frequency.value;
   }
 
-  source.connect(filter);
+  src.connect(filter);
   filter.connect(ctx.destination);
-  source.start();
+  src.start();
 
   return ctx.startRendering();
 }
 
 /* ============================================================
-   3. エネルギー（音量）を計算（frameSize=512）
+   3. Energy Series (frameSize = 512)
 ============================================================ */
 function getEnergySeries(audioBuffer, frameSize = 512) {
   const data = audioBuffer.getChannelData(0);
@@ -75,15 +71,15 @@ function getEnergySeries(audioBuffer, frameSize = 512) {
 }
 
 /* ============================================================
-   4. ピーク検出（かなり緩め）
+   4. Peak Detection (loose)
 ============================================================ */
 function detectPeaks(energies, thresholdFactor = 1.05) {
-  const avgEnergy = avg(energies);
-  const threshold = avgEnergy * thresholdFactor;
+  const base = avg(energies);
+  const th = base * thresholdFactor;
 
   const peaks = [];
   for (let i = 1; i < energies.length - 1; i++) {
-    if (energies[i] > threshold && energies[i] >= energies[i - 1] && energies[i] >= energies[i + 1]) {
+    if (energies[i] > th && energies[i] >= energies[i - 1] && energies[i] >= energies[i + 1]) {
       peaks.push(i);
     }
   }
@@ -91,23 +87,23 @@ function detectPeaks(energies, thresholdFactor = 1.05) {
 }
 
 /* ============================================================
-   5. ピーク間隔クラスタリング → BPM 推定
+   5. BPM Estimation (Kick + Snare)
 ============================================================ */
-function clusterIntervals(intervals, tolerance = 2) {
+function clusterIntervals(intervals, tol = 2) {
   const clusters = [];
-  intervals.forEach(interval => {
+  intervals.forEach(v => {
     let found = false;
     for (const c of clusters) {
-      if (Math.abs(c.value - interval) <= tolerance) {
+      if (Math.abs(c.value - v) <= tol) {
         c.count++;
         found = true;
         break;
       }
     }
-    if (!found) clusters.push({ value: interval, count: 1 });
+    if (!found) clusters.push({ value: v, count: 1 });
   });
   clusters.sort((a, b) => b.count - a.count);
-  return clusters.length ? clusters[0].value : null;
+  return clusters[0]?.value || null;
 }
 
 function normalizeBPM(bpm) {
@@ -116,17 +112,16 @@ function normalizeBPM(bpm) {
   return Math.round(bpm);
 }
 
-async function estimateBPMHighPrecision(audioBuffer, frameSize = 512) {
-  // Kick + Snare 両方を見る
-  const kickBuf = await filteredBuffer(audioBuffer, "lowpass", 40, 150);
-  const snareBuf = await filteredBuffer(audioBuffer, "bandpass", 150, 800);
+async function estimateBPM(audioBuffer, frameSize = 512) {
+  const kick = await filteredBuffer(audioBuffer, "lowpass", 40, 150);
+  const snare = await filteredBuffer(audioBuffer, "bandpass", 150, 800);
 
-  const { energies: kickE } = getEnergySeries(kickBuf, frameSize);
-  const { energies: snareE } = getEnergySeries(snareBuf, frameSize);
+  const { energies: kE } = getEnergySeries(kick, frameSize);
+  const { energies: sE } = getEnergySeries(snare, frameSize);
 
-  const energies = kickE.map((v, i) => v + (snareE[i] || 0));
-
+  const energies = kE.map((v, i) => v + (sE[i] || 0));
   const peaks = detectPeaks(energies, 1.05);
+
   if (peaks.length < 2) return 120;
 
   const intervals = [];
@@ -134,114 +129,91 @@ async function estimateBPMHighPrecision(audioBuffer, frameSize = 512) {
     intervals.push(peaks[i] - peaks[i - 1]);
   }
 
-  const bestInterval = clusterIntervals(intervals);
-  if (!bestInterval) return 120;
+  const best = clusterIntervals(intervals);
+  if (!best) return 120;
 
-  const secondsPerBeat = (bestInterval * frameSize) / audioBuffer.sampleRate;
-  let bpm = 60 / secondsPerBeat;
-  return normalizeBPM(bpm);
+  const secPerBeat = (best * frameSize) / audioBuffer.sampleRate;
+  return normalizeBPM(60 / secPerBeat);
 }
 
 /* ============================================================
-   6. 自動オフセット推定（＋安全なデフォルト）
+   6. Auto Offset
 ============================================================ */
-function estimateOffsetSec(peaks, bpm, frameSize, sampleRate) {
-  const diffs = [];
+function estimateOffset(peaks, bpm, frameSize, sampleRate) {
   const secPerBeat = 60 / bpm;
+  const diffs = [];
 
-  for (let i = 0; i < peaks.length; i++) {
-    const frameIndex = peaks[i];
-    const time = (frameIndex * frameSize) / sampleRate;
-    const beat = time / secPerBeat;
+  for (const p of peaks) {
+    const t = (p * frameSize) / sampleRate;
+    const beat = t / secPerBeat;
+    const ideal = Math.round(beat);
+    const diffSec = (beat - ideal) * secPerBeat;
 
-    const idealBeat = Math.round(beat);
-    const diffBeat = beat - idealBeat;
-    const diffSec = diffBeat * secPerBeat;
-
-    if (Math.abs(diffSec) < 0.12) {
-      diffs.push(diffSec);
-    }
+    if (Math.abs(diffSec) < 0.12) diffs.push(diffSec);
   }
 
-  let offset = avg(diffs);
-
-  if (!isFinite(offset) || diffs.length < 5) {
-    offset = 0.04; // 40ms 遅らせる
-  }
-
-  return offset;
+  if (diffs.length < 5) return 0.04;
+  const o = avg(diffs);
+  return Math.abs(o) < 0.002 ? 0.04 : o;
 }
 
 /* ============================================================
-   7. 曲構造のざっくり解析（イントロ / アウトロ）
+   7. Structure (Intro / Outro)
 ============================================================ */
 function analyzeStructure(energies, times) {
-  const totalDurSec = times[times.length - 1] || 0;
-  const totalAvg = avg(energies);
+  const total = times[times.length - 1] || 0;
+  const avgE = avg(energies);
 
-  const thirds = Math.floor(energies.length / 3);
-  const introAvg = avg(energies.slice(0, thirds));
-  const outroAvg = avg(energies.slice(thirds * 2));
+  const third = Math.floor(energies.length / 3);
+  const introAvg = avg(energies.slice(0, third));
+  const outroAvg = avg(energies.slice(third * 2));
 
-  let introEndSec = totalDurSec * 0.05;
-  if (introAvg < totalAvg * 0.7) {
-    introEndSec = totalDurSec * 0.10;
-  }
+  let introEnd = total * 0.05;
+  if (introAvg < avgE * 0.7) introEnd = total * 0.10;
 
-  let outroStartSec = totalDurSec * 0.9;
-  if (outroAvg < totalAvg * 0.7) {
-    outroStartSec = totalDurSec * 0.85;
-  }
+  let outroStart = total * 0.9;
+  if (outroAvg < avgE * 0.7) outroStart = total * 0.85;
 
-  return {
-    totalDurSec,
-    introEndSec,
-    outroStartSec
-  };
+  return { totalDurSec: total, introEndSec: introEnd, outroStartSec: outroStart };
 }
 
 /* ============================================================
-   8. レーン選択（人間工学ベース）
+   8. Lane Selection (Human Ergonomics)
 ============================================================ */
 function chooseLane() {
   const r = Math.random();
-  if (r < 0.35) return 1;  // 左中指
-  if (r < 0.70) return 2;  // 右中指
-  if (r < 0.85) return 0;  // 左薬指
-  return 3;                // 右薬指
+  if (r < 0.35) return 1;
+  if (r < 0.70) return 2;
+  if (r < 0.85) return 0;
+  return 3;
 }
 
 /* ============================================================
-   9. 拍グリッド fallback 生成（ピークが少ない曲用）
+   9. Beat Grid (always used)
 ============================================================ */
-function generateBeatGridPeaks(bpm, totalDurSec, frameSize, sampleRate) {
+function generateBeatGrid(bpm, totalSec, frameSize, sampleRate) {
   const secPerBeat = 60 / bpm;
   const peaks = [];
-
-  for (let t = 0; t < totalDurSec; t += secPerBeat) {
-    const frameIndex = Math.floor((t * sampleRate) / frameSize);
-    peaks.push(frameIndex);
+  for (let t = 0; t < totalSec; t += secPerBeat) {
+    peaks.push(Math.floor((t * sampleRate) / frameSize));
   }
-
   return peaks;
 }
 
 /* ============================================================
-   10. ノーツ生成（ピーク＋グリッド併用）
+   10. Note Generation (dense)
 ============================================================ */
 function generateNotes(peaks, bpm, frameSize, sampleRate, offsetSec, structure, energies, times) {
-  const allNotes = [];
+  const all = [];
   let lastBeat = -999;
   let lastLongEnd = -999;
 
   const secPerBeat = 60 / bpm;
-  const globalAvgEnergy = avg(energies);
+  const avgE = avg(energies) || 1;
 
-  for (let i = 0; i < peaks.length; i++) {
-    const frameIndex = peaks[i];
-    const rawTime = (frameIndex * frameSize) / sampleRate;
+  for (const p of peaks) {
+    const rawTime = (p * frameSize) / sampleRate;
     const time = rawTime - offsetSec;
-
     if (time < 0) continue;
 
     const beat = time / secPerBeat;
@@ -249,12 +221,12 @@ function generateNotes(peaks, bpm, frameSize, sampleRate, offsetSec, structure, 
     if (time < structure.introEndSec) continue;
     if (time > structure.outroStartSec) continue;
 
-    if (beat - lastBeat < 0.20) continue;
+    if (beat - lastBeat < 0.125) continue;
 
     const lane = chooseLane();
 
     let conflict = false;
-    for (const n of allNotes) {
+    for (const n of all) {
       if (n.lane === lane && n.type === "long") {
         if (beat >= n.beat - 0.15 && beat <= n.endBeat + 0.15) {
           conflict = true;
@@ -264,25 +236,25 @@ function generateNotes(peaks, bpm, frameSize, sampleRate, offsetSec, structure, 
     }
     if (conflict) continue;
 
-    const canLong = (beat - lastLongEnd >= 0.5);
+    const canLong = beat - lastLongEnd >= 0.5;
 
-    const energy = energies[i] || 0;
-    const energyRatio = energy / (globalAvgEnergy || 1);
+    const energy = energies[p] || 0;
+    const ratio = energy / avgE;
 
-    if (energyRatio < 0.15) continue;
+    if (ratio < 0.05) continue;
 
     lastBeat = beat;
 
     let isLong = false;
-    if (canLong && energyRatio > 0.7) {
+    if (canLong && ratio > 0.7) {
       isLong = Math.random() < 0.20;
     }
 
     if (isLong) {
-      const lengthBeat = 1 + Math.random() * 2;
-      const endBeat = beat + lengthBeat;
+      const len = 1 + Math.random() * 2;
+      const endBeat = beat + len;
 
-      allNotes.push({
+      all.push({
         lane,
         beat: Number(beat.toFixed(2)),
         endBeat: Number(endBeat.toFixed(2)),
@@ -291,7 +263,7 @@ function generateNotes(peaks, bpm, frameSize, sampleRate, offsetSec, structure, 
 
       lastLongEnd = endBeat;
     } else {
-      allNotes.push({
+      all.push({
         lane,
         beat: Number(beat.toFixed(2)),
         type: "tap"
@@ -300,13 +272,13 @@ function generateNotes(peaks, bpm, frameSize, sampleRate, offsetSec, structure, 
   }
 
   return {
-    easy: allNotes.filter((_, i) => i % 2 === 0),
-    hard: allNotes
+    easy: all.filter((_, i) => i % 2 === 0),
+    hard: all
   };
 }
 
 /* ============================================================
-   11. メイン解析処理
+   11. Main
 ============================================================ */
 async function analyze() {
   const url = document.getElementById("urlInput").value.trim();
@@ -326,36 +298,31 @@ async function analyze() {
     const frameSize = 512;
 
     status.textContent = "BPM 推定中...";
-    const bpm = await estimateBPMHighPrecision(audioBuffer, frameSize);
+    const bpm = await estimateBPM(audioBuffer, frameSize);
 
     status.textContent = "エネルギー解析中...";
     const { energies, times } = getEnergySeries(audioBuffer, frameSize);
 
     status.textContent = "ピーク検出中...";
-    // Kick + Snare 合成エネルギーでピークを取る
-    const kickBuf = await filteredBuffer(audioBuffer, "lowpass", 40, 150);
-    const snareBuf = await filteredBuffer(audioBuffer, "bandpass", 150, 800);
-    const { energies: kickE } = getEnergySeries(kickBuf, frameSize);
-    const { energies: snareE } = getEnergySeries(snareBuf, frameSize);
-    const combinedE = kickE.map((v, i) => v + (snareE[i] || 0));
+    const kick = await filteredBuffer(audioBuffer, "lowpass", 40, 150);
+    const snare = await filteredBuffer(audioBuffer, "bandpass", 150, 800);
+    const { energies: kE } = getEnergySeries(kick, frameSize);
+    const { energies: sE } = getEnergySeries(snare, frameSize);
+    const combined = kE.map((v, i) => v + (sE[i] || 0));
 
-    let peaks = detectPeaks(combinedE, 1.05);
+    let peaks = detectPeaks(combined, 1.05);
 
-    const structure = analyzeStructure(energies, times);
+    status.textContent = "曲構造解析中...";
+    const structure = analyzeStructure(combined, times);
 
-    status.textContent = "オフセット自動推定中...";
-    let offsetSec = 0.0;
-    if (peaks.length >= 4) {
-      offsetSec = estimateOffsetSec(peaks, bpm, frameSize, sampleRate);
-    } else {
-      offsetSec = 0.04;
-    }
+    status.textContent = "オフセット推定中...";
+    let offsetSec = peaks.length >= 4
+      ? estimateOffset(peaks, bpm, frameSize, sampleRate)
+      : 0.04;
 
-    // ピークが少なすぎる場合は BPM グリッドで補完
-    if (peaks.length < 8) {
-      const gridPeaks = generateBeatGridPeaks(bpm, structure.totalDurSec, frameSize, sampleRate);
-      peaks = gridPeaks;
-    }
+    // ★ Always merge beat grid for density
+    const grid = generateBeatGrid(bpm, structure.totalDurSec, frameSize, sampleRate);
+    peaks = [...peaks, ...grid].sort((a, b) => a - b);
 
     status.textContent = "ノーツ生成中...";
     const patterns = generateNotes(
@@ -365,7 +332,7 @@ async function analyze() {
       sampleRate,
       offsetSec,
       structure,
-      combinedE,
+      combined,
       times
     );
 
