@@ -8,7 +8,7 @@ async function loadAudio(url) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   }
 
-  // ★ ブラウザの自動再生制限対策（最重要）
+  // ★ ブラウザの自動再生制限対策
   if (audioCtx.state === "suspended") {
     await audioCtx.resume();
   }
@@ -130,11 +130,27 @@ async function estimateBPMHighPrecision(audioBuffer, frameSize = 1024) {
 }
 
 /* ============================================================
-   8. ノーツ生成（4レーン・ロング対応・重複禁止）
+   8. レーン選択（人間工学ベース）
+============================================================ */
+function chooseLane() {
+  const r = Math.random();
+
+  // Easy-friendly distribution:
+  // 中指レーン（1,2）を多めに → 押しやすい
+  // 薬指レーン（0,3）を少なめに → 負荷軽減
+  if (r < 0.35) return 1;  // 左中指
+  if (r < 0.70) return 2;  // 右中指
+  if (r < 0.85) return 0;  // 左薬指
+  return 3;                // 右薬指
+}
+
+/* ============================================================
+   9. ノーツ生成（重複禁止・ロング間隔確保）
 ============================================================ */
 function generateNotes(peaks, bpm, frameSize, sampleRate) {
   const allNotes = [];
   let lastBeat = -999;
+  let lastLongEnd = -999;
 
   for (let i = 0; i < peaks.length; i++) {
     const frameIndex = peaks[i];
@@ -144,13 +160,13 @@ function generateNotes(peaks, bpm, frameSize, sampleRate) {
     // ノーツ詰まり防止
     if (beat - lastBeat < 0.25) continue;
 
-    const lane = Math.floor(Math.random() * 4);
+    const lane = chooseLane();
 
-    // ★ ロングノーツと通常ノーツの重複禁止
+    // ★ ロングノーツの途中・終端 ±0.20 を禁止
     let conflict = false;
     for (const n of allNotes) {
       if (n.lane === lane && n.type === "long") {
-        if (beat >= n.beat && beat <= n.endBeat) {
+        if (beat >= n.beat - 0.20 && beat <= n.endBeat + 0.20) {
           conflict = true;
           break;
         }
@@ -158,18 +174,35 @@ function generateNotes(peaks, bpm, frameSize, sampleRate) {
     }
     if (conflict) continue;
 
+    // ★ ロングノーツ同士の間隔確保（0.8 beat 以上）
+    if (beat - lastLongEnd < 0.8) {
+      // ロング禁止 → tap のみ許可
+      allNotes.push({
+        lane,
+        beat: Number(beat.toFixed(2)),
+        type: "tap"
+      });
+      lastBeat = beat;
+      continue;
+    }
+
     lastBeat = beat;
 
+    // ロングノーツ生成（20%）
     const isLong = Math.random() < 0.20;
 
     if (isLong) {
       const lengthBeat = 1 + Math.random() * 2;
+      const endBeat = beat + lengthBeat;
+
       allNotes.push({
         lane,
         beat: Number(beat.toFixed(2)),
-        endBeat: Number((beat + lengthBeat).toFixed(2)),
+        endBeat: Number(endBeat.toFixed(2)),
         type: "long"
       });
+
+      lastLongEnd = endBeat;
     } else {
       allNotes.push({
         lane,
@@ -186,7 +219,7 @@ function generateNotes(peaks, bpm, frameSize, sampleRate) {
 }
 
 /* ============================================================
-   9. メイン解析処理
+   10. メイン解析処理
 ============================================================ */
 async function analyze() {
   const url = document.getElementById("urlInput").value.trim();
