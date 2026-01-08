@@ -8,7 +8,7 @@ function avg(arr) {
 }
 
 /* ============================================================
-   1. Load Audio (with autoplay fix)
+   1. Load Audio
 ============================================================ */
 async function loadAudio(url) {
   if (!audioCtx) {
@@ -71,7 +71,7 @@ function getEnergySeries(audioBuffer, frameSize = 512) {
 }
 
 /* ============================================================
-   4. Peak Detection (loose)
+   4. Peak Detection
 ============================================================ */
 function detectPeaks(energies, thresholdFactor = 1.05) {
   const base = avg(energies);
@@ -87,7 +87,7 @@ function detectPeaks(energies, thresholdFactor = 1.05) {
 }
 
 /* ============================================================
-   5. BPM Estimation (Kick + Snare)
+   5. BPM Estimation
 ============================================================ */
 function clusterIntervals(intervals, tol = 2) {
   const clusters = [];
@@ -178,14 +178,14 @@ function analyzeStructure(energies, times) {
 }
 
 /* ============================================================
-   8. Lane Selection (Human Ergonomics)
+   8. Lane Selection (0–3: playable, 4: internal)
 ============================================================ */
 function chooseLane() {
   const r = Math.random();
-  if (r < 0.35) return 1;
-  if (r < 0.70) return 2;
-  if (r < 0.85) return 0;
-  return 3;
+  if (r < 0.35) return 1; // 左中指
+  if (r < 0.70) return 2; // 右中指
+  if (r < 0.85) return 0; // 左薬指
+  return 3;               // 右薬指
 }
 
 /* ============================================================
@@ -201,7 +201,7 @@ function generateBeatGrid(bpm, totalSec, frameSize, sampleRate) {
 }
 
 /* ============================================================
-   10. Note Generation (dense)
+   10. Note Generation (with internal markers)
 ============================================================ */
 function generateNotes(peaks, bpm, frameSize, sampleRate, offsetSec, structure, energies, times) {
   const all = [];
@@ -271,9 +271,25 @@ function generateNotes(peaks, bpm, frameSize, sampleRate, offsetSec, structure, 
     }
   }
 
+  // ★ 内部マーカー（5番レーン = lane:4）
+  const totalBeats = structure.totalDurSec / secPerBeat;
+
+  all.push({
+    lane: 4,
+    beat: 0,
+    type: "marker"
+  });
+
+  all.push({
+    lane: 4,
+    beat: Number(totalBeats.toFixed(2)),
+    type: "marker"
+  });
+
   return {
-    easy: all.filter((_, i) => i % 2 === 0),
-    hard: all
+    easy: all.filter(n => n.lane !== 4).filter((_, i) => i % 2 === 0),
+    hard: all.filter(n => n.lane !== 4),
+    internalMarkers: all.filter(n => n.lane === 4)
   };
 }
 
@@ -320,7 +336,6 @@ async function analyze() {
       ? estimateOffset(peaks, bpm, frameSize, sampleRate)
       : 0.04;
 
-    // ★ Always merge beat grid for density
     const grid = generateBeatGrid(bpm, structure.totalDurSec, frameSize, sampleRate);
     peaks = [...peaks, ...grid].sort((a, b) => a - b);
 
